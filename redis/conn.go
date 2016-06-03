@@ -51,6 +51,9 @@ type conn struct {
 
 	// Scratch space for formatting integers and floats.
 	numScratch [40]byte
+
+	bytesPool *sync.Pool
+	ifsPool   *sync.Pool
 }
 
 // DialTimeout acts like Dial but takes timeouts for establishing the
@@ -410,7 +413,7 @@ var (
 	pongReply interface{} = "PONG"
 )
 
-func (c *conn) readReply() (interface{}, error) {
+func (c *conn) readReply(bytesPool *sync.Pool, ifsPool *sync.Pool) (interface{}, error) {
 	line, err := c.readLine()
 	if err != nil {
 		return nil, err
@@ -439,7 +442,17 @@ func (c *conn) readReply() (interface{}, error) {
 		if n < 0 || err != nil {
 			return nil, err
 		}
-		p := make([]byte, n)
+		var p []byte
+		if bytesPool == nil {
+			p = make([]byte, n)
+		} else {
+			p = bytesPool.Get().([]byte)
+			if cap(p) < n {
+				p = make([]byte, n)
+			} else {
+				p = p[:n]
+			}
+		}
 		_, err = io.ReadFull(c.br, p)
 		if err != nil {
 			return nil, err
@@ -455,9 +468,19 @@ func (c *conn) readReply() (interface{}, error) {
 		if n < 0 || err != nil {
 			return nil, err
 		}
-		r := make([]interface{}, n)
+		var r []interface{}
+		if ifsPool == nil {
+			r = make([]interface{}, n)
+		} else {
+			r = ifsPool.Get().([]interface{})
+			if cap(r) < n {
+				r = make([]interface{}, n)
+			} else {
+				r = r[:n]
+			}
+		}
 		for i := range r {
-			r[i], err = c.readReply()
+			r[i], err = c.readReply(bytesPool, ifsPool)
 			if err != nil {
 				return nil, err
 			}
@@ -491,10 +514,14 @@ func (c *conn) Flush() error {
 }
 
 func (c *conn) Receive() (reply interface{}, err error) {
+	c.mu.Lock()
+	bytesPool := c.bytesPool
+	ifsPool := c.ifsPool
+	c.mu.Unlock()
 	if c.readTimeout != 0 {
 		c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
 	}
-	if reply, err = c.readReply(); err != nil {
+	if reply, err = c.readReply(bytesPool, ifsPool); err != nil {
 		return nil, c.fatal(err)
 	}
 	// When using pub/sub, the number of receives can be greater than the
@@ -519,6 +546,8 @@ func (c *conn) Do(cmd string, args ...interface{}) (interface{}, error) {
 	c.mu.Lock()
 	pending := c.pending
 	c.pending = 0
+	bytesPool := c.bytesPool
+	ifsPool := c.ifsPool
 	c.mu.Unlock()
 
 	if cmd == "" && pending == 0 {
@@ -546,7 +575,7 @@ func (c *conn) Do(cmd string, args ...interface{}) (interface{}, error) {
 	if cmd == "" {
 		reply := make([]interface{}, pending)
 		for i := range reply {
-			r, e := c.readReply()
+			r, e := c.readReply(bytesPool, ifsPool)
 			if e != nil {
 				return nil, c.fatal(e)
 			}
@@ -559,7 +588,7 @@ func (c *conn) Do(cmd string, args ...interface{}) (interface{}, error) {
 	var reply interface{}
 	for i := 0; i <= pending; i++ {
 		var e error
-		if reply, e = c.readReply(); e != nil {
+		if reply, e = c.readReply(bytesPool, ifsPool); e != nil {
 			return nil, c.fatal(e)
 		}
 		if e, ok := reply.(Error); ok && err == nil {
@@ -567,4 +596,36 @@ func (c *conn) Do(cmd string, args ...interface{}) (interface{}, error) {
 		}
 	}
 	return reply, err
+}
+
+func (c *conn) SetPools(bytesPool *sync.Pool, ifsPool *sync.Pool) {
+	c.mu.Lock()
+	c.bytesPool = bytesPool
+	c.ifsPool = ifsPool
+	c.mu.Unlock()
+}
+
+func (c *conn) freeReply(r interface{}, bytesPool *sync.Pool, ifsPool *sync.Pool) {
+	switch v := r.(type) {
+	case []byte:
+		if bytesPool != nil {
+			c.bytesPool.Put(v)
+		}
+	case []interface{}:
+		for _, x := range v {
+			c.freeReply(x, bytesPool, ifsPool)
+		}
+		if ifsPool != nil {
+			c.ifsPool.Put(v)
+		}
+	}
+}
+
+func (c *conn) FreeReply(r interface{}) {
+	c.mu.Lock()
+	bytesPool := c.bytesPool
+	ifsPool := c.ifsPool
+	c.mu.Unlock()
+
+	c.freeReply(r, bytesPool, ifsPool)
 }

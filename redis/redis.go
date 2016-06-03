@@ -14,6 +14,10 @@
 
 package redis
 
+import (
+	"sync"
+)
+
 // Error represents an error returned in a command reply.
 type Error string
 
@@ -41,4 +45,8 @@ type Conn interface {
 
 	// Receive receives a single reply from the Redis server
 	Receive() (reply interface{}, err error)
+
+	SetPools(bytesPool *sync.Pool, ifsPool *sync.Pool)
+
+	FreeReply(reply interface{})
 }

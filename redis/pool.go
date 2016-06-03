@@ -123,6 +123,9 @@ type Pool struct {
 	// for a connection to be returned to the pool before returning.
 	Wait bool
 
+	BytesPool *sync.Pool
+	IfsPool   *sync.Pool
+
 	// mu protects fields defined below.
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -258,6 +261,7 @@ func (p *Pool) get() (Conn, error) {
 				p.mu.Unlock()
 				c = nil
 			}
+			c.SetPools(p.BytesPool, p.IfsPool)
 			return c, err
 		}
 
@@ -383,6 +387,14 @@ func (pc *pooledConnection) Receive() (reply interface{}, err error) {
 	return pc.c.Receive()
 }
 
+func (pc *pooledConnection) SetPools(bytesPool *sync.Pool, ifsPool *sync.Pool) {
+	pc.c.SetPools(bytesPool, ifsPool)
+}
+
+func (pc *pooledConnection) FreeReply(reply interface{}) {
+	pc.c.FreeReply(reply)
+}
+
 type errorConnection struct{ err error }
 
 func (ec errorConnection) Do(string, ...interface{}) (interface{}, error) { return nil, ec.err }
@@ -391,3 +403,5 @@ func (ec errorConnection) Err() error                                     { retu
 func (ec errorConnection) Close() error                                   { return ec.err }
 func (ec errorConnection) Flush() error                                   { return ec.err }
 func (ec errorConnection) Receive() (interface{}, error)                  { return nil, ec.err }
+func (ec errorConnection) SetPools(*sync.Pool, *sync.Pool)                {}
+func (ec errorConnection) FreeReply(reply interface{})                    {}
